@@ -19,8 +19,20 @@ Implementation of a platform independent renderer class, which performs Metal se
 {
     id<MTLDevice> _device;
 
+    MTLRenderPassDescriptor *_renderPassDescriptor;
+
     // The render pipeline generated from the vertex and fragment shaders in the .metal shader file.
     id<MTLRenderPipelineState> _pipelineState;
+
+    id<MTLDepthStencilState> _depthStencilState;
+
+    id<MTLTexture> _depthStencilTexture;
+
+    MTLRenderPassDescriptor *_presentRenderPassDescriptor;
+
+    id<MTLRenderPipelineState> _presentPipelineState;
+
+    id<MTLDepthStencilState> _presentDepthStencilState;
 
     // The command queue used to pass commands to the device.
     id<MTLCommandQueue> _commandQueue;
@@ -38,6 +50,20 @@ Implementation of a platform independent renderer class, which performs Metal se
 
         _device = mtkView.device;
 
+        MTLRenderPassDepthAttachmentDescriptor *depthAttachment = [[MTLRenderPassDepthAttachmentDescriptor alloc] init];
+        depthAttachment.loadAction = MTLLoadActionClear;
+        depthAttachment.storeAction = MTLStoreActionDontCare;
+        depthAttachment.clearDepth = 0.5;
+
+        MTLRenderPassStencilAttachmentDescriptor *stencilAttachment = [[MTLRenderPassStencilAttachmentDescriptor alloc] init];
+        stencilAttachment.loadAction = MTLLoadActionClear;
+        stencilAttachment.storeAction = MTLStoreActionStore;
+        stencilAttachment.clearStencil = 0;
+
+        _renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
+        _renderPassDescriptor.depthAttachment = depthAttachment;
+        _renderPassDescriptor.stencilAttachment = stencilAttachment;
+
         // Load all the shader files with a .metal file extension in the project.
         id<MTLLibrary> defaultLibrary = [_device newDefaultLibrary];
 
@@ -46,10 +72,10 @@ Implementation of a platform independent renderer class, which performs Metal se
 
         // Configure a pipeline descriptor that is used to create a pipeline state.
         MTLRenderPipelineDescriptor *pipelineStateDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
-        pipelineStateDescriptor.label = @"Simple Pipeline";
         pipelineStateDescriptor.vertexFunction = vertexFunction;
         pipelineStateDescriptor.fragmentFunction = fragmentFunction;
-        pipelineStateDescriptor.colorAttachments[0].pixelFormat = mtkView.colorPixelFormat;
+        pipelineStateDescriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+        pipelineStateDescriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
 
         _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineStateDescriptor
                                                                  error:&error];
@@ -59,6 +85,58 @@ Implementation of a platform independent renderer class, which performs Metal se
         //  went wrong.  (Metal API validation is enabled by default when a debug build is run
         //  from Xcode.)
         NSAssert(_pipelineState, @"Failed to create pipeline state: %@", error);
+
+        MTLStencilDescriptor *stencilDescriptor = [[MTLStencilDescriptor alloc] init];
+        stencilDescriptor.stencilCompareFunction = MTLCompareFunctionAlways;
+        stencilDescriptor.stencilFailureOperation = MTLStencilOperationKeep;
+        stencilDescriptor.depthFailureOperation = MTLStencilOperationReplace;
+        stencilDescriptor.depthStencilPassOperation = MTLStencilOperationInvert;
+        stencilDescriptor.readMask = 0;
+        stencilDescriptor.writeMask = 0xFFFFFFFF;
+
+        MTLDepthStencilDescriptor *depthStencilDescriptor = [[MTLDepthStencilDescriptor alloc] init];
+        depthStencilDescriptor.depthCompareFunction = MTLCompareFunctionLess;
+        depthStencilDescriptor.depthWriteEnabled = NO;
+        depthStencilDescriptor.frontFaceStencil = stencilDescriptor;
+
+        _depthStencilState = [_device newDepthStencilStateWithDescriptor:depthStencilDescriptor];
+
+        {
+            MTLRenderPassColorAttachmentDescriptor *colorAttachment = [[MTLRenderPassColorAttachmentDescriptor alloc] init];
+            colorAttachment.loadAction = MTLLoadActionClear;
+            colorAttachment.storeAction = MTLStoreActionStore;
+            colorAttachment.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+
+            MTLRenderPassStencilAttachmentDescriptor *stencilAttachment = [[MTLRenderPassStencilAttachmentDescriptor alloc] init];
+            stencilAttachment.loadAction = MTLLoadActionLoad;
+            stencilAttachment.storeAction = MTLStoreActionDontCare;
+
+            _presentRenderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
+            _presentRenderPassDescriptor.colorAttachments[0] = colorAttachment;
+            _presentRenderPassDescriptor.stencilAttachment = stencilAttachment;
+
+            id<MTLFunction> fragmentFunction = [defaultLibrary newFunctionWithName:@"presentFragmentShader"];
+            
+            // Configure a pipeline descriptor that is used to create a pipeline state.
+            MTLRenderPipelineDescriptor *pipelineStateDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
+            pipelineStateDescriptor.vertexFunction = vertexFunction;
+            pipelineStateDescriptor.fragmentFunction = fragmentFunction;
+            pipelineStateDescriptor.colorAttachments[0].pixelFormat = mtkView.colorPixelFormat;
+            pipelineStateDescriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+            
+            _presentPipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineStateDescriptor
+                                                                     error:&error];
+
+            MTLStencilDescriptor *stencilDescriptor = [[MTLStencilDescriptor alloc] init];
+            stencilDescriptor.stencilCompareFunction = MTLCompareFunctionEqual;
+            stencilDescriptor.readMask = 0xFFFFFFFF;
+            stencilDescriptor.writeMask = 0;
+
+            MTLDepthStencilDescriptor *depthStencilDescriptor = [[MTLDepthStencilDescriptor alloc] init];
+            depthStencilDescriptor.frontFaceStencil = stencilDescriptor;
+
+            _presentDepthStencilState = [_device newDepthStencilStateWithDescriptor:depthStencilDescriptor];
+        }
 
         // Create the command queue
         _commandQueue = [_device newCommandQueue];
@@ -73,57 +151,78 @@ Implementation of a platform independent renderer class, which performs Metal se
     // Save the size of the drawable to pass to the vertex shader.
     _viewportSize.x = size.width;
     _viewportSize.y = size.height;
+
+    MTLTextureDescriptor *textureDescriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8 width:size.width height:size.height mipmapped:false];
+    textureDescriptor.resourceOptions = MTLResourceStorageModePrivate;
+    textureDescriptor.usage = MTLTextureUsageRenderTarget;
+
+    _depthStencilTexture = [_device newTextureWithDescriptor:textureDescriptor];
+
+    _renderPassDescriptor.depthAttachment.texture = _depthStencilTexture;
+    _renderPassDescriptor.stencilAttachment.texture = _depthStencilTexture;
+    
+    _presentRenderPassDescriptor.stencilAttachment.texture = _depthStencilTexture;
 }
 
 /// Called whenever the view needs to render a frame.
 - (void)drawInMTKView:(nonnull MTKView *)view
 {
-    static const AAPLVertex triangleVertices[] =
-    {
-        // 2D positions,    RGBA colors
-        { {  250,  -250 }, { 1, 0, 0, 1 } },
-        { { -250,  -250 }, { 0, 1, 0, 1 } },
-        { {    0,   250 }, { 0, 0, 1, 1 } },
-    };
-
     // Create a new command buffer for each render pass to the current drawable.
     id<MTLCommandBuffer> commandBuffer = [_commandQueue commandBuffer];
     commandBuffer.label = @"MyCommand";
 
-    // Obtain a renderPassDescriptor generated from the view's drawable textures.
-    MTLRenderPassDescriptor *renderPassDescriptor = view.currentRenderPassDescriptor;
-
-    if(renderPassDescriptor != nil)
     {
-        // Create a render command encoder.
-        id<MTLRenderCommandEncoder> renderEncoder =
-        [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
-        renderEncoder.label = @"MyRenderEncoder";
-
-        // Set the region of the drawable to draw into.
+        id<MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:_renderPassDescriptor];
+        renderEncoder.label = @"Write stencil";
+        
         [renderEncoder setViewport:(MTLViewport){0.0, 0.0, _viewportSize.x, _viewportSize.y, 0.0, 1.0 }];
         
         [renderEncoder setRenderPipelineState:_pipelineState];
-
-        // Pass in the parameter data.
-        [renderEncoder setVertexBytes:triangleVertices
-                               length:sizeof(triangleVertices)
-                              atIndex:AAPLVertexInputIndexVertices];
         
-        [renderEncoder setVertexBytes:&_viewportSize
-                               length:sizeof(_viewportSize)
-                              atIndex:AAPLVertexInputIndexViewportSize];
+        [renderEncoder setFrontFacingWinding:MTLWindingCounterClockwise];
+        
+        [renderEncoder setDepthStencilState:_depthStencilState];
+        
+        [renderEncoder setStencilReferenceValue:128];
+        
+        [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle
+                          vertexStart:0
+                          vertexCount:3];
+        
+        [renderEncoder endEncoding];
+    }
 
+
+    {
+        _presentRenderPassDescriptor.colorAttachments[0].texture = view.currentDrawable.texture;
+        
+        // Create a render command encoder.
+        id<MTLRenderCommandEncoder> renderEncoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:_presentRenderPassDescriptor];
+        renderEncoder.label = @"present";
+        
+        // Set the region of the drawable to draw into.
+        [renderEncoder setViewport:(MTLViewport){0.0, 0.0, _viewportSize.x, _viewportSize.y, 0.0, 1.0 }];
+        
+        [renderEncoder setRenderPipelineState:_presentPipelineState];
+        
+        [renderEncoder setFrontFacingWinding:MTLWindingCounterClockwise];
+
+        [renderEncoder setDepthStencilState:_presentDepthStencilState];
+
+        [renderEncoder setStencilReferenceValue:128];
+        
         // Draw the triangle.
         [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle
                           vertexStart:0
                           vertexCount:3];
-
+        
         [renderEncoder endEncoding];
-
-        // Schedule a present once the framebuffer is complete using the current drawable.
-        [commandBuffer presentDrawable:view.currentDrawable];
     }
+
+    // Schedule a present once the framebuffer is complete using the current drawable.
+    [commandBuffer presentDrawable:view.currentDrawable];
 
     // Finalize rendering here & push the command buffer to the GPU.
     [commandBuffer commit];
